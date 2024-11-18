@@ -4,8 +4,10 @@ import { Prisma, PrismaClient } from '@prisma/client';
 import { ClientProxy, RpcException } from '@nestjs/microservices';
 import { OrderPaginationDto } from './dto/order-pagination.dto';
 import { changeOrderStatusDto } from './dto/change-order-status.dto';
-import { NATS_SERVERS } from 'src/config/services';
+import { NATS_SERVICE } from 'src/config/services';
 import { firstValueFrom } from 'rxjs';
+import { OrderWithProducts } from './interfaces/order-with-products.interface';
+import { PaidOrderDto } from './dto/paid-order.dto';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
@@ -13,7 +15,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
   private readonly logger = new Logger('OrdersService')
 
   constructor(
-    @Inject(NATS_SERVERS) private readonly client: ClientProxy
+    @Inject(NATS_SERVICE) private readonly client: ClientProxy
   ) {
     super()
   }
@@ -28,11 +30,13 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     try {
 
       const productIds = createOrderDto.items.map(item => item.productId)
-  
+      
+      //Validate if exists products in database
       const products : any[] = await firstValueFrom(
         this.client.send({ cmd: 'validate_products' }, productIds)
       )
       
+      //Get total amount of the order
       const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
 
         const price = products.find(product => product.id === orderItem.productId).price
@@ -41,6 +45,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
 
       }, 0)
 
+      //Get quantity
       const totalItems = createOrderDto.items.reduce((acc, orderItem) => {
 
         return acc + orderItem.quantity
@@ -97,6 +102,8 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
         status: status
       },
     });
+
+    //Get last page of the pagination
     const lastPage = Math.ceil(totalItems / limit);
 
 
@@ -169,6 +176,47 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       this.handleErrors(e, id)
     }
     
+  }
+
+  async createPaymentSession(order: OrderWithProducts) {
+
+    const paymentSession = await firstValueFrom(
+      this.client.send('create.payment.session', {
+        orderId: order.id,
+        currency: 'usd',
+        items: order.OrderItem.map(item => ({
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity
+        }))
+      })
+    )
+
+    return paymentSession;
+
+  }
+
+
+  async paidOrder(paidOrderDto: PaidOrderDto) {
+
+    const order = this.order.update({
+      where: { id: paidOrderDto.orderId },
+      data: {
+        status: 'PAID',
+        paid: true,
+        paidAt: new Date(),
+        stripeChargeId: paidOrderDto.stripePaymentId,
+        //La relacion
+        OrderReceipt: {
+          create: {
+            receiptUrl: paidOrderDto.receiptUrl
+          }
+        }
+      }
+    })
+
+    return order;
+
   }
 
   private handleErrors(e, id) {
